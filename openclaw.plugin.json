@@ -5,16 +5,30 @@
     "properties": {
       "publicKey": {
         "type": "string",
-        "description": "Langfuse public key"
+        "description": "Langfuse public key (single target mode)"
       },
       "secretKey": {
         "type": "string",
-        "description": "Langfuse secret key"
+        "description": "Langfuse secret key (single target mode)"
       },
       "baseUrl": {
         "type": "string",
         "default": "https://cloud.langfuse.com",
         "description": "Langfuse server URL"
+      },
+      "targets": {
+        "type": "array",
+        "description": "Multiple Langfuse targets (overrides publicKey/secretKey)",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string", "description": "Target display name" },
+            "publicKey": { "type": "string" },
+            "secretKey": { "type": "string" },
+            "baseUrl": { "type": "string" }
+          },
+          "required": ["publicKey", "secretKey"]
+        }
       },
       "debug": {
         "type": "boolean",
@@ -24,9 +38,8 @@
       "enabledHooks": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "List of hooks to enable"
+        "description": "List of hooks to enable (if not set, all hooks are enabled)"
       }
-    },
-    "required": []
+    }
   }
 }

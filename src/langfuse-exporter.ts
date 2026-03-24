@@ -1,6 +1,7 @@
 import { Langfuse } from "langfuse";
 import http from "node:http";
 import https from "node:https";
+import crypto from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // Direct fetch using node:http/https — completely bypasses global-agent proxy
@@ -48,6 +49,7 @@ function directFetch(url: string | URL, init: RequestInit = {}): Promise<Respons
           ),
           text: () => Promise.resolve(text),
           json: () => Promise.resolve(JSON.parse(text)),
+          body: null,
         } as any);
       });
     });
@@ -62,11 +64,25 @@ function directFetch(url: string | URL, init: RequestInit = {}): Promise<Respons
   });
 }
 
-export interface LangfusePluginConfig {
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface TargetConfig {
+  name?: string;
   publicKey: string;
   secretKey: string;
   baseUrl?: string;
   debug?: boolean;
+}
+
+export interface LangfusePluginConfig {
+  publicKey?: string;
+  secretKey?: string;
+  baseUrl?: string;
+  debug?: boolean;
+  targets?: TargetConfig[];
+  enabledHooks?: string[];
 }
 
 export interface PluginApi {
@@ -74,7 +90,7 @@ export interface PluginApi {
     info: (msg: string) => void;
     error: (msg: string) => void;
     warn: (msg: string) => void;
-    debug: (msg: string) => void;
+    debug?: (msg: string) => void;
   };
 }
 
@@ -91,76 +107,103 @@ interface SpanData {
   parentSpanId?: string;
 }
 
-export class LangfuseExporter {
-  private config: LangfusePluginConfig;
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+function parseInput(attributes?: Record<string, any>): any {
+  if (!attributes) return undefined;
+  const input: Record<string, any> = {};
+  if (attributes["gen_ai.input.messages"]) {
+    try { input.messages = JSON.parse(attributes["gen_ai.input.messages"]); }
+    catch { input.messages = attributes["gen_ai.input.messages"]; }
+  }
+  if (attributes["gen_ai.system_instructions"]) {
+    try { input.systemPrompt = JSON.parse(attributes["gen_ai.system_instructions"]); }
+    catch { input.systemPrompt = attributes["gen_ai.system_instructions"]; }
+  }
+  return Object.keys(input).length > 0 ? input : undefined;
+}
+
+function parseOutput(attributes?: Record<string, any>): any {
+  if (!attributes) return undefined;
+  const output: Record<string, any> = {};
+  if (attributes["gen_ai.output.messages"]) {
+    try { output.messages = JSON.parse(attributes["gen_ai.output.messages"]); }
+    catch { output.messages = attributes["gen_ai.output.messages"]; }
+  }
+  return Object.keys(output).length > 0 ? output : undefined;
+}
+
+function createLangfuseClient(target: TargetConfig): Langfuse {
+  const client = new Langfuse({
+    publicKey: target.publicKey,
+    secretKey: target.secretKey,
+    baseUrl: target.baseUrl || "https://cloud.langfuse.com",
+    requestTimeout: 30000,
+  });
+  // Monkey-patch fetch to use node:http directly, bypassing global-agent proxy
+  (client as any).fetch = directFetch;
+  return client;
+}
+
+// ---------------------------------------------------------------------------
+// SingleTargetExporter — one Langfuse client with its own trace/span maps
+// ---------------------------------------------------------------------------
+
+class SingleTargetExporter {
   private api: PluginApi;
+  private label: string;
   private langfuse: Langfuse;
   private traceMap = new Map<string, any>();
   private spanMap = new Map<string, any>();
-  private initialized = false;
+  private agentSpanMap = new Map<string, any>();
+  private debug: boolean;
 
-  constructor(api: PluginApi, config: LangfusePluginConfig) {
+  constructor(api: PluginApi, target: TargetConfig, label: string) {
     this.api = api;
-    this.config = config;
-
-    this.langfuse = new Langfuse({
-      publicKey: config.publicKey,
-      secretKey: config.secretKey,
-      baseUrl: config.baseUrl || "https://cloud.langfuse.com",
-      requestTimeout: 30000,
-    });
-    // Monkey-patch fetch to use node:http directly, bypassing global-agent proxy
-    (this.langfuse as any).fetch = directFetch;
-
-    this.initialized = true;
-    if (config.debug) {
-      this.api.logger.debug(`[Langfuse] Initialized with baseUrl: ${config.baseUrl || "https://cloud.langfuse.com"}`);
-    }
-    this.api.logger.info(`[Langfuse] Plugin initialized`);
+    this.label = label;
+    this.langfuse = createLangfuseClient(target);
+    this.debug = target.debug || false;
   }
 
-  /**
-   * Get or create a Langfuse trace for the given traceId
-   */
   getOrCreateTrace(traceId: string, metadata: Record<string, any> = {}): any {
     let trace = this.traceMap.get(traceId);
     if (!trace) {
       trace = this.langfuse.trace({
         name: `openclaw-${traceId.slice(0, 8)}`,
-        metadata: {
-          ...metadata,
-          source: "openclaw-plugin",
-        },
+        metadata: { ...metadata, source: "openclaw-plugin" },
       });
       this.traceMap.set(traceId, trace);
-      if (this.config.debug) {
-        this.api.logger.debug(`[Langfuse] Created trace: ${traceId}`);
-      }
     }
     return trace;
   }
 
-  /**
-   * Start a root or agent span
-   */
+  updateTrace(traceId: string, updates: Record<string, any> = {}): void {
+    const trace = this.traceMap.get(traceId);
+    if (trace) {
+      trace.update(updates);
+    }
+  }
+
+  /** Get the parent to nest under: agent span if exists, otherwise trace */
+  private _getParent(traceId: string): any {
+    const agentSpan = this.agentSpanMap.get(traceId);
+    if (agentSpan) return agentSpan;
+    return this.traceMap.get(traceId);
+  }
+
   async startSpan(spanData: SpanData, customSpanId?: string): Promise<void> {
     const trace = this.getOrCreateTrace(spanData.traceId, {
       channelId: spanData.attributes?.["openclaw.channel.id"],
     });
-
     const spanId = customSpanId || spanData.spanId;
     const startTime = new Date(spanData.startTime);
 
     if (spanData.type === "entry" || !spanData.parentSpanId) {
-      // Root span - create a trace-level event
-      const event = trace.event({
-        name: spanData.name,
-        startTime,
-        metadata: spanData.attributes,
-      });
-      this.spanMap.set(spanId, { type: "event", obj: event, trace });
+      // Skip creating entry events — they create flat siblings that break the graph.
+      this.spanMap.set(spanId, { type: "event", obj: null, trace });
     } else if (spanData.type === "agent") {
-      // Agent span - use span
       const span = trace.span({
         name: spanData.name,
         startTime,
@@ -168,99 +211,72 @@ export class LangfuseExporter {
         input: spanData.input,
       });
       this.spanMap.set(spanId, { type: "span", obj: span, trace });
-      if (this.config.debug) {
-        this.api.logger.debug(`[Langfuse] Started agent span: ${spanData.name}`);
-      }
+      this.agentSpanMap.set(spanData.traceId, span);
     } else if (spanData.type === "model") {
-      // LLM generation - use generation
-      const generation = trace.generation({
+      const parent = this._getParent(spanData.traceId);
+      const generation = parent.generation({
         name: spanData.name,
         model: spanData.attributes?.["gen_ai.request.model"] || "unknown",
         startTime,
         metadata: spanData.attributes,
-        input: this.parseInput(spanData.attributes),
-        output: this.parseOutput(spanData.attributes),
+        input: parseInput(spanData.attributes),
+        output: parseOutput(spanData.attributes),
       });
       this.spanMap.set(spanId, { type: "generation", obj: generation, trace });
-      if (this.config.debug) {
-        this.api.logger.debug(`[Langfuse] Started generation: ${spanData.name}`);
-      }
     }
   }
 
-  /**
-   * End a span by ID
-   */
   endSpanById(
     spanId: string,
     endTime: number,
     additionalAttrs?: Record<string, any>,
     output?: any,
-    _input?: any
+    _input?: any,
   ): void {
     const spanInfo = this.spanMap.get(spanId);
     if (!spanInfo) return;
 
-    const endDate = new Date(endTime);
-
     if (spanInfo.type === "generation" && spanInfo.obj) {
-      // Update generation with output and usage
-      const generation = spanInfo.obj;
       if (additionalAttrs) {
-        (generation as any).update({
+        spanInfo.obj.update({
           metadata: additionalAttrs,
-          output: output || this.parseOutput(additionalAttrs),
+          output: output || parseOutput(additionalAttrs),
         });
       }
-      (generation as any).end();
-      if (this.config.debug) {
-        this.api.logger.debug(`[Langfuse] Ended generation: spanId=${spanId}`);
-      }
+      spanInfo.obj.end();
     } else if (spanInfo.type === "span" && spanInfo.obj) {
-      const span = spanInfo.obj;
       if (additionalAttrs) {
-        (span as any).update({
+        spanInfo.obj.update({
           metadata: additionalAttrs,
-          output: output,
+          output: output || undefined,
         });
       }
-      (span as any).end();
-      if (this.config.debug) {
-        this.api.logger.debug(`[Langfuse] Ended span: spanId=${spanId}`);
-      }
-    } else if (spanInfo.type === "event" && spanInfo.obj) {
-      // Langfuse events are fire-and-forget, no .end() or .update()
+      spanInfo.obj.end();
     }
-
+    // event type: fire-and-forget
     this.spanMap.delete(spanId);
   }
 
-  /**
-   * Export a short-lived span (fire-and-forget)
-   */
   async export(spanData: SpanData): Promise<void> {
     const trace = this.getOrCreateTrace(spanData.traceId, {
       channelId: spanData.attributes?.["openclaw.channel.id"],
     });
-
+    const parent = this._getParent(spanData.traceId);
     const startTime = new Date(spanData.startTime);
-    const endTime = spanData.endTime ? new Date(spanData.endTime) : new Date();
 
     if (spanData.type === "model") {
-      // LLM generation
       const usageInput = spanData.attributes?.["gen_ai.usage.input_tokens"];
       const usageOutput = spanData.attributes?.["gen_ai.usage.output_tokens"];
 
-      const generation = trace.generation({
+      const generation = parent.generation({
         name: spanData.name,
         model: spanData.attributes?.["gen_ai.request.model"] || "unknown",
         startTime,
         metadata: spanData.attributes,
-        input: this.parseInput(spanData.attributes),
-        output: this.parseOutput(spanData.attributes),
+        input: parseInput(spanData.attributes),
+        output: parseOutput(spanData.attributes),
       });
 
-      // Update with usage if available
       if (usageInput !== undefined || usageOutput !== undefined) {
         const usage: Record<string, number> = {};
         if (usageInput !== undefined) usage.promptTokens = usageInput;
@@ -268,115 +284,113 @@ export class LangfuseExporter {
         if (usageInput !== undefined && usageOutput !== undefined) {
           usage.totalTokens = usageInput + usageOutput;
         }
-        (generation as any).update({ usage });
+        generation.update({ usage });
       }
-
-      (generation as any).end();
-      if (this.config.debug) {
-        this.api.logger.debug(`[Langfuse] Exported generation: ${spanData.name}`);
-      }
+      generation.end();
     } else if (spanData.type === "tool") {
-      // Tool call span
-      const span = trace.span({
+      // Use "tool-create" event type directly for TOOL observation type
+      // TOOL type is required for Langfuse graph/DAG rendering
+      const toolId = crypto.randomUUID();
+      (this.langfuse as any).enqueue("tool-create", {
+        id: toolId,
+        traceId: parent.traceId,
+        parentObservationId: parent.observationId || undefined,
         name: spanData.name,
         startTime,
+        endTime: new Date(),
         metadata: spanData.attributes,
         input: spanData.attributes?.["gen_ai.tool.call.arguments"],
         output: spanData.attributes?.["gen_ai.tool.call.result"],
-      });
-      (span as any).end();
-      if (this.config.debug) {
-        this.api.logger.debug(`[Langfuse] Exported tool span: ${spanData.name}`);
-      }
-    } else if (spanData.type === "session" || spanData.type === "gateway") {
-      // Session/gateway events (fire-and-forget, no .end())
-      trace.event({
-        name: spanData.name,
-        startTime,
-        metadata: spanData.attributes,
+        environment: "default",
       });
     } else {
-      // Default to event (fire-and-forget, no .end())
-      trace.event({
-        name: spanData.name,
-        startTime,
-        metadata: spanData.attributes,
-      });
+      // session/gateway/default events: fire-and-forget
+      trace.event({ name: spanData.name, startTime, metadata: spanData.attributes });
     }
   }
 
-  /**
-   * End the current trace
-   */
   endTrace(): void {
     this.traceMap.clear();
     this.spanMap.clear();
+    this.agentSpanMap.clear();
   }
 
-  /**
-   * Flush pending data to Langfuse
-   */
   async flush(): Promise<void> {
     await this.langfuse.flushAsync();
-    if (this.config.debug) {
-      this.api.logger.debug(`[Langfuse] Flushed`);
-    }
   }
 
-  /**
-   * Dispose and shutdown
-   */
   async dispose(): Promise<void> {
     await this.langfuse.flushAsync();
     await this.langfuse.shutdownAsync();
     this.traceMap.clear();
     this.spanMap.clear();
-    this.api.logger.info(`[Langfuse] Plugin disposed`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-target facade — delegates every call to all SingleTargetExporters
+// ---------------------------------------------------------------------------
+
+export class LangfuseExporter {
+  private api: PluginApi;
+  private config: LangfusePluginConfig;
+  private targets: SingleTargetExporter[] = [];
+
+  constructor(api: PluginApi, config: LangfusePluginConfig) {
+    this.api = api;
+    this.config = config;
+
+    // Build target list: support both single config and targets array
+    const targetConfigs: TargetConfig[] = config.targets || [
+      {
+        publicKey: config.publicKey!,
+        secretKey: config.secretKey!,
+        baseUrl: config.baseUrl,
+        debug: config.debug,
+      },
+    ];
+
+    for (const t of targetConfigs) {
+      if (!t.publicKey || !t.secretKey) continue;
+      const label = t.name || t.baseUrl || "default";
+      this.targets.push(new SingleTargetExporter(api, t, label));
+      api.logger.info(`[Langfuse] Target added: ${label}`);
+    }
+
+    api.logger.info(`[Langfuse] Plugin initialized with ${this.targets.length} target(s)`);
   }
 
-  /**
-   * Parse input from attributes
-   */
-  private parseInput(attributes?: Record<string, any>): any {
-    if (!attributes) return undefined;
-
-    const input: Record<string, any> = {};
-
-    if (attributes["gen_ai.input.messages"]) {
-      try {
-        input.messages = JSON.parse(attributes["gen_ai.input.messages"]);
-      } catch {
-        input.messages = attributes["gen_ai.input.messages"];
-      }
-    }
-
-    if (attributes["gen_ai.system_instructions"]) {
-      try {
-        input.systemPrompt = JSON.parse(attributes["gen_ai.system_instructions"]);
-      } catch {
-        input.systemPrompt = attributes["gen_ai.system_instructions"];
-      }
-    }
-
-    return Object.keys(input).length > 0 ? input : undefined;
+  getOrCreateTrace(traceId: string, metadata?: Record<string, any>): any {
+    return this.targets[0]?.getOrCreateTrace(traceId, metadata);
   }
 
-  /**
-   * Parse output from attributes
-   */
-  private parseOutput(attributes?: Record<string, any>): any {
-    if (!attributes) return undefined;
+  async startSpan(spanData: SpanData, customSpanId?: string): Promise<void> {
+    await Promise.allSettled(this.targets.map(t => t.startSpan(spanData, customSpanId)));
+  }
 
-    const output: Record<string, any> = {};
+  updateTrace(traceId: string, updates: Record<string, any>): void {
+    for (const t of this.targets) t.updateTrace(traceId, updates);
+  }
 
-    if (attributes["gen_ai.output.messages"]) {
-      try {
-        output.messages = JSON.parse(attributes["gen_ai.output.messages"]);
-      } catch {
-        output.messages = attributes["gen_ai.output.messages"];
-      }
-    }
+  endSpanById(spanId: string, endTime: number, additionalAttrs?: Record<string, any>, output?: any, _input?: any): void {
+    for (const t of this.targets) t.endSpanById(spanId, endTime, additionalAttrs, output, _input);
+  }
 
-    return Object.keys(output).length > 0 ? output : undefined;
+  async export(spanData: SpanData): Promise<void> {
+    await Promise.allSettled(this.targets.map(t => t.export(spanData)));
+  }
+
+  endTrace(): void {
+    for (const t of this.targets) t.endTrace();
+  }
+
+  async flush(): Promise<void> {
+    await Promise.allSettled(this.targets.map(t => t.flush()));
+    if (this.config.debug) this.api.logger.debug?.(`[Langfuse] Flushed ${this.targets.length} target(s)`);
+  }
+
+  async dispose(): Promise<void> {
+    await Promise.allSettled(this.targets.map(t => t.dispose()));
+    this.api.logger.info(`[Langfuse] Plugin disposed (${this.targets.length} targets)`);
   }
 }
