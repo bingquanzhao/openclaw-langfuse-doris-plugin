@@ -243,7 +243,7 @@ class SingleTargetExporter {
           output: output || parseOutput(additionalAttrs),
         });
       }
-      spanInfo.obj.end();
+      spanInfo.obj.end({ endTime: endTime ? new Date(endTime) : undefined });
     } else if (spanInfo.type === "span" && spanInfo.obj) {
       if (additionalAttrs) {
         spanInfo.obj.update({
@@ -251,7 +251,7 @@ class SingleTargetExporter {
           output: output || undefined,
         });
       }
-      spanInfo.obj.end();
+      spanInfo.obj.end({ endTime: endTime ? new Date(endTime) : undefined });
     }
     // event type: fire-and-forget
     this.spanMap.delete(spanId);
@@ -268,25 +268,24 @@ class SingleTargetExporter {
       const usageInput = spanData.attributes?.["gen_ai.usage.input_tokens"];
       const usageOutput = spanData.attributes?.["gen_ai.usage.output_tokens"];
 
+      const endTime = spanData.endTime ? new Date(spanData.endTime) : new Date();
+      const usage: Record<string, number> = {};
+      if (usageInput !== undefined) usage.promptTokens = usageInput;
+      if (usageOutput !== undefined) usage.completionTokens = usageOutput;
+      if (usageInput !== undefined && usageOutput !== undefined) {
+        usage.totalTokens = usageInput + usageOutput;
+      }
+
       const generation = parent.generation({
         name: spanData.name,
         model: spanData.attributes?.["gen_ai.request.model"] || "unknown",
         startTime,
+        endTime,
         metadata: spanData.attributes,
         input: parseInput(spanData.attributes),
         output: parseOutput(spanData.attributes),
+        ...(Object.keys(usage).length > 0 ? { usage } : {}),
       });
-
-      if (usageInput !== undefined || usageOutput !== undefined) {
-        const usage: Record<string, number> = {};
-        if (usageInput !== undefined) usage.promptTokens = usageInput;
-        if (usageOutput !== undefined) usage.completionTokens = usageOutput;
-        if (usageInput !== undefined && usageOutput !== undefined) {
-          usage.totalTokens = usageInput + usageOutput;
-        }
-        generation.update({ usage });
-      }
-      generation.end();
     } else if (spanData.type === "tool") {
       // Use "tool-create" event type directly for TOOL observation type
       // TOOL type is required for Langfuse graph/DAG rendering

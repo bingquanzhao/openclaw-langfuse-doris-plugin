@@ -198,6 +198,9 @@ function activate(api: OpenClawPluginApi): void {
   let lastLlmStartTime: number | undefined;
   let lastLlmSpanId: string | undefined;
 
+  // Per-runId LLM timing — survives context linking failures
+  const llmTimingByRunId = new Map<string, { startTime: number; spanId: string; systemInstructions?: string; inputMessages?: string }>();
+
   const openclawVersion = (api as any).runtime?.version || "unknown";
 
   const shouldHookEnabled = (hookName: string): boolean => {
@@ -542,6 +545,16 @@ function activate(api: OpenClawPluginApi): void {
       lastLlmStartTime = ctx.llmStartTime;
       lastLlmSpanId = ctx.llmSpanId;
 
+      // Store per-runId for reliable lookup in llm_output
+      if (event.runId) {
+        llmTimingByRunId.set(event.runId, {
+          startTime: ctx.llmStartTime,
+          spanId: ctx.llmSpanId,
+          systemInstructions: ctx.llmSystemInstructions,
+          inputMessages: ctx.llmInputMessages,
+        });
+      }
+
       if (config.debug) {
         api.logger.info(`[Langfuse] LLM input started: ${event.provider}/${event.model}, runId=${event.runId}`);
       }
@@ -559,7 +572,10 @@ function activate(api: OpenClawPluginApi): void {
       }
 
       const now = Date.now();
-      const startTime = ctx.llmStartTime || lastLlmStartTime || now;
+
+      // Lookup LLM timing: ctx → global → per-runId map → fallback to now
+      const runTiming = event.runId ? llmTimingByRunId.get(event.runId) : undefined;
+      const startTime = ctx.llmStartTime || lastLlmStartTime || runTiming?.startTime || now;
 
       if (event.assistantTexts?.length) {
         const outputText = event.assistantTexts.join("\n");
@@ -570,9 +586,9 @@ function activate(api: OpenClawPluginApi): void {
         }
       }
 
-      const systemInstructions = ctx.llmSystemInstructions || lastLlmSystemInstructions;
-      const inputMessages = ctx.llmInputMessages || lastLlmInputMessages;
-      const llmSpanId = ctx.llmSpanId || lastLlmSpanId;
+      const systemInstructions = ctx.llmSystemInstructions || lastLlmSystemInstructions || runTiming?.systemInstructions;
+      const inputMessages = ctx.llmInputMessages || lastLlmInputMessages || runTiming?.inputMessages;
+      const llmSpanId = ctx.llmSpanId || lastLlmSpanId || runTiming?.spanId;
 
       const lastAssistantUsage = (event.lastAssistant as any)?.usage;
       const inputTokens = event.usage?.input ?? lastAssistantUsage?.input ?? 0;
@@ -625,6 +641,7 @@ function activate(api: OpenClawPluginApi): void {
       lastLlmInputMessages = undefined;
       lastLlmStartTime = undefined;
       lastLlmSpanId = undefined;
+      if (event.runId) llmTimingByRunId.delete(event.runId);
 
       await exporter.export(span);
 
