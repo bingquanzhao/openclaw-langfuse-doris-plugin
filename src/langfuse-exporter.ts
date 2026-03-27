@@ -113,28 +113,63 @@ interface SpanData {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/** Extract text content from a parts-based message */
+function extractTextFromParts(parts: any[]): string {
+  if (!Array.isArray(parts)) return "";
+  return parts
+    .filter((p: any) => p.type === "text" || p.type === "reasoning")
+    .map((p: any) => p.content || p.text || "")
+    .join("\n");
+}
+
+/** Convert parts-based messages to Langfuse ChatMessage[] format: [{ role, content }] */
+function toChatMessages(messages: any[]): { role: string; content: string }[] {
+  if (!Array.isArray(messages)) return [];
+  return messages.map((msg: any) => ({
+    role: msg.role || "user",
+    content: msg.parts ? extractTextFromParts(msg.parts) : (typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? "")),
+  }));
+}
+
 function parseInput(attributes?: Record<string, any>): any {
   if (!attributes) return undefined;
-  const input: Record<string, any> = {};
-  if (attributes["gen_ai.input.messages"]) {
-    try { input.messages = JSON.parse(attributes["gen_ai.input.messages"]); }
-    catch { input.messages = attributes["gen_ai.input.messages"]; }
-  }
+  const result: { role: string; content: string }[] = [];
+
+  // System prompt as first message
   if (attributes["gen_ai.system_instructions"]) {
-    try { input.systemPrompt = JSON.parse(attributes["gen_ai.system_instructions"]); }
-    catch { input.systemPrompt = attributes["gen_ai.system_instructions"]; }
+    try {
+      const parsed = JSON.parse(attributes["gen_ai.system_instructions"]);
+      const text = Array.isArray(parsed) ? extractTextFromParts(parsed) : String(parsed);
+      if (text) result.push({ role: "system", content: text });
+    } catch {
+      result.push({ role: "system", content: String(attributes["gen_ai.system_instructions"]) });
+    }
   }
-  return Object.keys(input).length > 0 ? input : undefined;
+
+  // History + user messages
+  if (attributes["gen_ai.input.messages"]) {
+    try {
+      const parsed = JSON.parse(attributes["gen_ai.input.messages"]);
+      result.push(...toChatMessages(parsed));
+    } catch {
+      // fallback: raw string
+    }
+  }
+
+  return result.length > 0 ? result : undefined;
 }
 
 function parseOutput(attributes?: Record<string, any>): any {
   if (!attributes) return undefined;
-  const output: Record<string, any> = {};
   if (attributes["gen_ai.output.messages"]) {
-    try { output.messages = JSON.parse(attributes["gen_ai.output.messages"]); }
-    catch { output.messages = attributes["gen_ai.output.messages"]; }
+    try {
+      const parsed = JSON.parse(attributes["gen_ai.output.messages"]);
+      return toChatMessages(parsed);
+    } catch {
+      // fallback
+    }
   }
-  return Object.keys(output).length > 0 ? output : undefined;
+  return undefined;
 }
 
 function createLangfuseClient(target: TargetConfig): Langfuse {
@@ -276,14 +311,28 @@ class SingleTargetExporter {
     if (spanData.type === "model") {
       const usageInput = spanData.attributes?.["gen_ai.usage.input_tokens"];
       const usageOutput = spanData.attributes?.["gen_ai.usage.output_tokens"];
+      const cacheRead = spanData.attributes?.["gen_ai.usage.cache_read.input_tokens"];
+      const cacheWrite = spanData.attributes?.["gen_ai.usage.cache_creation.input_tokens"];
 
       const endTime = spanData.endTime ? new Date(spanData.endTime) : new Date();
-      const usage: Record<string, number> = {};
-      if (usageInput !== undefined) usage.promptTokens = usageInput;
-      if (usageOutput !== undefined) usage.completionTokens = usageOutput;
-      if (usageInput !== undefined && usageOutput !== undefined) {
-        usage.totalTokens = usageInput + usageOutput;
-      }
+
+      // Pass Anthropic's raw token breakdown to Langfuse via usageDetails.
+      // Keys match default-model-prices.json so Langfuse calculates cost correctly:
+      //   input                          → $3/MTok
+      //   output                         → $15/MTok
+      //   cache_read_input_tokens        → $0.30/MTok
+      //   cache_creation_input_tokens    → $3.75/MTok
+      // Server auto-calculates "total" from all keys (IngestionService:1401-1407).
+      const hasUsage = (usageInput !== undefined && usageInput > 0) ||
+                       (usageOutput !== undefined && usageOutput > 0) ||
+                       (cacheRead !== undefined && cacheRead > 0) ||
+                       (cacheWrite !== undefined && cacheWrite > 0);
+      const usageDetails: Record<string, number> | undefined = hasUsage ? {
+        input: usageInput ?? 0,
+        output: usageOutput ?? 0,
+        cache_read_input_tokens: cacheRead ?? 0,
+        cache_creation_input_tokens: cacheWrite ?? 0,
+      } : undefined;
 
       const generation = parent.generation({
         name: spanData.name,
@@ -293,8 +342,12 @@ class SingleTargetExporter {
         metadata: spanData.attributes,
         input: parseInput(spanData.attributes),
         output: parseOutput(spanData.attributes),
-        ...(Object.keys(usage).length > 0 ? { usage } : {}),
       });
+
+      if (usageDetails) {
+        generation.update({ usageDetails });
+      }
+      generation.end({ endTime });
     } else if (spanData.type === "tool") {
       // Use "tool-create" event type directly for TOOL observation type
       // TOOL type is required for Langfuse graph/DAG rendering

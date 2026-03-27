@@ -591,11 +591,14 @@ function activate(api: OpenClawPluginApi): void {
       const inputMessages = ctx.llmInputMessages || lastLlmInputMessages || runTiming?.inputMessages;
       const llmSpanId = ctx.llmSpanId || lastLlmSpanId || runTiming?.spanId;
 
+      // event.usage = cumulative across all LLM calls (from getUsageTotals)
+      // lastAssistant.usage = per-call from API response (may be all zeros)
+      // Prefer event.usage as it has actual token counts when available
       const lastAssistantUsage = (event.lastAssistant as any)?.usage;
       const inputTokens = event.usage?.input ?? lastAssistantUsage?.input ?? 0;
       const outputTokens = event.usage?.output ?? lastAssistantUsage?.output ?? 0;
-      const cacheReadTokens = event.usage?.cacheRead ?? 0;
-      const cacheCreationTokens = event.usage?.cacheWrite ?? 0;
+      const cacheReadTokens = event.usage?.cacheRead ?? lastAssistantUsage?.cacheRead ?? 0;
+      const cacheCreationTokens = event.usage?.cacheWrite ?? lastAssistantUsage?.cacheWrite ?? 0;
 
       const lastAssistantObj = event.lastAssistant as any;
       const stopReason =
