@@ -577,8 +577,21 @@ function activate(api: OpenClawPluginApi): void {
       const runTiming = event.runId ? llmTimingByRunId.get(event.runId) : undefined;
       const startTime = ctx.llmStartTime || lastLlmStartTime || runTiming?.startTime || now;
 
+      // Extract output text: prefer assistantTexts, fallback to lastAssistant.content
+      let outputTexts: string[] = [];
       if (event.assistantTexts?.length) {
-        const outputText = event.assistantTexts.join("\n");
+        outputTexts = event.assistantTexts;
+      } else if (event.lastAssistant?.content) {
+        for (const part of event.lastAssistant.content) {
+          if (part.type === "text" && part.text) {
+            const text = part.text.replace(/^\[\[reply_to_current\]\]\s*/, "");
+            if (text) outputTexts.push(text);
+          }
+        }
+      }
+
+      if (outputTexts.length) {
+        const outputText = outputTexts.join("\n");
         ctx.lastOutput = outputText;
 
         if (lastUserTraceContext) {
@@ -627,8 +640,8 @@ function activate(api: OpenClawPluginApi): void {
         llmAttrs["gen_ai.input.messages"] = inputMessages;
       }
 
-      if (event.assistantTexts?.length) {
-        llmAttrs["gen_ai.output.messages"] = formatOutputMessages(event.assistantTexts, stopReason || "stop");
+      if (outputTexts.length) {
+        llmAttrs["gen_ai.output.messages"] = formatOutputMessages(outputTexts, stopReason || "stop");
       }
 
       const span = createSpan(ctx, channelId, `chat ${event.model}`, "model", startTime, now, llmAttrs);
@@ -816,14 +829,12 @@ function activate(api: OpenClawPluginApi): void {
         ctx.agentStartTime = undefined;
       }
 
-      // Snapshot references before clearing global pointers.
+      // Snapshot references — do NOT clear global pointers yet.
+      // llm_output may fire after agent_end and still needs lastUserTraceContext
+      // to link to the correct context.
       const savedLastUserTraceContext = lastUserTraceContext;
       const savedLastUserChannelId = lastUserChannelId;
       const originalChannelId = ctx.originalChannelId || savedLastUserChannelId || channelId;
-
-      // Clear global pointers immediately
-      lastUserChannelId = undefined;
-      lastUserTraceContext = undefined;
 
       const rootCtx = savedLastUserTraceContext || ctx;
 
@@ -900,6 +911,10 @@ function activate(api: OpenClawPluginApi): void {
             }
           }
 
+          // Clear global pointers (deferred to allow llm_output to use them)
+          lastUserChannelId = undefined;
+          lastUserTraceContext = undefined;
+
           // Clean up Map entries
           if (savedLastUserChannelId) endTurn(savedLastUserChannelId);
           if (originalChannelId && originalChannelId !== savedLastUserChannelId) {
@@ -915,6 +930,8 @@ function activate(api: OpenClawPluginApi): void {
           exporter.endTrace();
         }, 200);
       } else {
+        lastUserChannelId = undefined;
+        lastUserTraceContext = undefined;
         if (savedLastUserChannelId) endTurn(savedLastUserChannelId);
         if (originalChannelId && originalChannelId !== savedLastUserChannelId) {
           endTurn(originalChannelId);
