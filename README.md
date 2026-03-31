@@ -4,13 +4,28 @@ OpenClaw plugin for reporting AI agent execution traces to [Langfuse](https://la
 
 ## Install
 
+### From GitHub (latest)
+
+```bash
+# Clone to OpenClaw extensions directory
+git clone https://github.com/bingquanzhao/openclaw-langfuse-doris-plugin.git \
+  ~/.openclaw/extensions/openclaw-langfuse-plugin
+
+# Install dependencies
+cd ~/.openclaw/extensions/openclaw-langfuse-plugin && npm install
+```
+
+### From npm
+
 ```bash
 openclaw plugins install openclaw-langfuse-plugin
 ```
 
+> **Note:** The npm version may lag behind the GitHub repository. For the latest features and fixes, install from GitHub.
+
 ## Configure
 
-Add the plugin config to your `openclaw.json`:
+Edit `~/.openclaw/openclaw.json` to add the plugin configuration:
 
 ### Single Langfuse target
 
@@ -34,7 +49,7 @@ Add the plugin config to your `openclaw.json`:
 
 ### Multiple Langfuse targets
 
-Send traces to multiple Langfuse instances simultaneously:
+Send traces to multiple Langfuse instances simultaneously. All targets receive identical trace and observation IDs for cross-instance data comparison.
 
 ```jsonc
 {
@@ -57,7 +72,9 @@ Send traces to multiple Langfuse instances simultaneously:
               "secretKey": "sk-lf-yyy",
               "baseUrl": "http://langfuse-analytics:3000"
             }
-          ]
+          ],
+          "tags": ["openclaw", "my-instance"],
+          "environment": "production"
         }
       }
     }
@@ -65,13 +82,11 @@ Send traces to multiple Langfuse instances simultaneously:
 }
 ```
 
-### Or via CLI
+### Apply configuration
 
 ```bash
-openclaw plugins enable openclaw-langfuse-plugin
+openclaw gateway restart
 ```
-
-Then edit `~/.openclaw/openclaw.json` to add your Langfuse credentials.
 
 ## Config Options
 
@@ -102,7 +117,27 @@ Then edit `~/.openclaw/openclaw.json` to add your Langfuse credentials.
 | Agent duration & stats | `agent_end` | Metrics |
 | Session lifecycle | `session_start/end` | Events |
 
+### Token Usage & Cost
+
+For Anthropic models, the plugin reports accurate token breakdown including cache metrics:
+
+- `input` — non-cached input tokens
+- `output` — output tokens
+- `cache_read_input_tokens` — tokens read from prompt cache
+- `cache_creation_input_tokens` — tokens written to prompt cache
+
+Langfuse calculates cost from its model pricing definitions, with per-tier pricing for cached vs non-cached tokens.
+
 ## Update
+
+### From GitHub
+
+```bash
+cd ~/.openclaw/extensions/openclaw-langfuse-plugin && git pull && npm install
+openclaw gateway restart
+```
+
+### From npm
 
 ```bash
 openclaw plugins update
@@ -111,6 +146,10 @@ openclaw plugins update
 ## Uninstall
 
 ```bash
+# If installed from GitHub
+rm -rf ~/.openclaw/extensions/openclaw-langfuse-plugin
+
+# If installed from npm
 openclaw plugins uninstall openclaw-langfuse-plugin
 ```
 
