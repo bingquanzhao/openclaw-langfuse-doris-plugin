@@ -160,48 +160,60 @@ interface PendingToolCall {
   channelId: string;
 }
 
+// Module-level state — survives hot-reloads
+let cachedConfig: LangfusePluginConfig | undefined;
+let _contextByChannelId: Map<string, TraceContext> | undefined;
+let _contextByRunId: Map<string, TraceContext> | undefined;
+let _llmTimingByRunId: Map<string, { startTime: number; spanId: string; systemInstructions?: string; inputMessages?: string }> | undefined;
+let lastUserChannelId: string | undefined;
+let lastUserTraceContext: TraceContext | undefined;
+let lastLlmSystemInstructions: string | undefined;
+let lastLlmInputMessages: string | undefined;
+let lastLlmStartTime: number | undefined;
+let lastLlmSpanId: string | undefined;
+
 function activate(api: OpenClawPluginApi): void {
   const pluginConfig = (api.pluginConfig || {}) as Record<string, any>;
 
-  // When using targets array, publicKey/secretKey are optional at top level
-  if (!pluginConfig.targets && !pluginConfig.publicKey) {
+  const hasConfig = pluginConfig.targets || pluginConfig.publicKey;
+
+  if (hasConfig) {
+    // Validate secretKey for single-target mode
+    if (!pluginConfig.targets && !pluginConfig.secretKey) {
+      api.logger.error("[Langfuse] Missing required configuration: 'secretKey' or 'targets' must be provided");
+      return;
+    }
+    cachedConfig = {
+      publicKey: pluginConfig.publicKey,
+      secretKey: pluginConfig.secretKey,
+      baseUrl: pluginConfig.baseUrl,
+      debug: pluginConfig.debug || false,
+      enabledHooks: pluginConfig.enabledHooks,
+      targets: pluginConfig.targets,
+      tags: pluginConfig.tags,
+      environment: pluginConfig.environment,
+      userId: pluginConfig.userId,
+    };
+  } else if (cachedConfig) {
+    api.logger.info("[Langfuse] Hot-reload without config, using cached configuration");
+  } else {
     api.logger.error("[Langfuse] Missing required configuration: 'publicKey' or 'targets' must be provided");
     return;
   }
-  if (!pluginConfig.targets && !pluginConfig.secretKey) {
-    api.logger.error("[Langfuse] Missing required configuration: 'secretKey' or 'targets' must be provided");
-    return;
-  }
 
-  const config: LangfusePluginConfig = {
-    publicKey: pluginConfig.publicKey,
-    secretKey: pluginConfig.secretKey,
-    baseUrl: pluginConfig.baseUrl,
-    debug: pluginConfig.debug || false,
-    enabledHooks: pluginConfig.enabledHooks,
-    targets: pluginConfig.targets,
-    tags: pluginConfig.tags,
-    environment: pluginConfig.environment,
-    userId: pluginConfig.userId,
-  };
+  const config = cachedConfig!;
 
   const exporter = new LangfuseExporter(api, config);
 
-  // -- Trace context management -------------------------------------------
-  const contextByChannelId = new Map<string, TraceContext>();
-  const contextByRunId = new Map<string, TraceContext>();
+  // -- Trace context management (module-level to survive hot-reloads) ------
+  if (!_contextByChannelId) _contextByChannelId = new Map();
+  if (!_contextByRunId) _contextByRunId = new Map();
+  if (!_llmTimingByRunId) _llmTimingByRunId = new Map();
+  const contextByChannelId = _contextByChannelId;
+  const contextByRunId = _contextByRunId;
+  const llmTimingByRunId = _llmTimingByRunId;
 
-  let lastUserChannelId: string | undefined;
-  let lastUserTraceContext: TraceContext | undefined;
   let pendingToolCall: PendingToolCall | undefined;
-
-  let lastLlmSystemInstructions: string | undefined;
-  let lastLlmInputMessages: string | undefined;
-  let lastLlmStartTime: number | undefined;
-  let lastLlmSpanId: string | undefined;
-
-  // Per-runId LLM timing — survives context linking failures
-  const llmTimingByRunId = new Map<string, { startTime: number; spanId: string; systemInstructions?: string; inputMessages?: string }>();
 
   const openclawVersion = (api.config as any)?.meta?.lastTouchedVersion || (api as any).runtime?.version || "unknown";
 
