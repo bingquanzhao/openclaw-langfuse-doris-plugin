@@ -270,6 +270,7 @@ class SingleTargetExporter {
         startTime,
         metadata: stripMessageAttrs(spanData.attributes),
         input: spanData.input,
+        environment: this.environment,
       });
       this.spanMap.set(spanId, { type: "span", obj: span, trace });
       this.agentSpanMap.set(spanData.traceId, span);
@@ -283,6 +284,7 @@ class SingleTargetExporter {
         metadata: stripMessageAttrs(spanData.attributes),
         input: parseInput(spanData.attributes),
         output: parseOutput(spanData.attributes),
+        environment: this.environment,
       });
       this.spanMap.set(spanId, { type: "generation", obj: generation, trace });
     }
@@ -362,6 +364,7 @@ class SingleTargetExporter {
         metadata: stripMessageAttrs(spanData.attributes),
         input: parseInput(spanData.attributes),
         output: parseOutput(spanData.attributes),
+        environment: this.environment,
       });
 
       if (usageDetails) {
@@ -385,7 +388,7 @@ class SingleTargetExporter {
       });
     } else {
       // session/gateway/default events: fire-and-forget
-      trace.event({ id: spanData.spanId, name: spanData.name, startTime, metadata: spanData.attributes });
+      trace.event({ id: spanData.spanId, name: spanData.name, startTime, metadata: spanData.attributes, environment: this.environment });
     }
   }
 
